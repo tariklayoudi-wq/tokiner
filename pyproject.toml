@@ -9,5 +9,13 @@ description = "Provider-agnostic, quota-aware router for Hermes Agent (minimal P
 license = { text = "MIT" }
 requires-python = ">=3.12"
 
+# Non-secret configuration for local demo (FastAPI, testing)
+dependencies = [
+    "fastapi>=0.95",
+    "uvicorn>=0.22",
+    "httpx>=0.24",
+    "pytest>=7.0"
+]
+
 [tool.pytest]
 addopts = ["-q"]

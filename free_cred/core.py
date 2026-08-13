@@ -1,7 +1,8 @@
 from __future__ import annotations
 from typing import Optional, Protocol, List, Callable, Any, Dict
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime
+import math
 import time
 
 
@@ -19,41 +20,79 @@ class Provider(Protocol):
     def call(self, *args, **kwargs) -> Any: ...
 
 
+from enum import Enum
+
+
+class CircuitState(str, Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
 class CircuitBreaker:
-    """Simple time-based circuit breaker.
-    - opens after max_failures
-    - stays open for reset_timeout seconds
-    - automatic half-open after timeout (next call allowed)
+    """Circuit breaker with explicit states and injectable clock for deterministic tests.
+
+    States:
+    - CLOSED: normal operation
+    - OPEN: calls are blocked until reset_timeout elapses
+    - HALF_OPEN: one or more calls are allowed to probe recovery
+
+    Behavior:
+    - After max_failures in CLOSED -> OPEN (opened_at recorded)
+    - When OPEN and (clock() - opened_at) >= reset_timeout -> HALF_OPEN
+    - In HALF_OPEN: a failure immediately re-opens; a success closes and resets counters
+
+    Clock injection: pass clock=callable() (defaults to time.time)
     """
 
-    def __init__(self, max_failures: int = 3, reset_timeout: int = 60):
+    def __init__(self, max_failures: int = 3, reset_timeout: int = 60, clock: Callable[[], float] = time.time):
         self.max_failures = max_failures
         self.reset_timeout = reset_timeout
+        self.clock = clock
         self.failures = 0
+        self.state: CircuitState = CircuitState.CLOSED
         self.opened_at: Optional[float] = None
+
+    def _to_open(self) -> None:
+        self.state = CircuitState.OPEN
+        self.opened_at = self.clock()
+        self.failures = 0
 
     def record_success(self) -> None:
         self.failures = 0
+        self.state = CircuitState.CLOSED
         self.opened_at = None
 
     def record_failure(self) -> None:
+        # In HALF_OPEN, any failure re-opens immediately
+        if self.state == CircuitState.HALF_OPEN:
+            self._to_open()
+            return
         self.failures += 1
-        if self.failures >= self.max_failures and self.opened_at is None:
-            self.opened_at = time.time()
+        if self.state == CircuitState.CLOSED and self.failures >= self.max_failures:
+            self._to_open()
 
     def is_open(self) -> bool:
-        if self.opened_at is None:
-            return False
-        if (time.time() - self.opened_at) > self.reset_timeout:
-            # auto-reset (half-open)
-            self.failures = 0
-            self.opened_at = None
-            return False
-        return True
+        if self.state == CircuitState.OPEN:
+            # check if timeout expired -> move to HALF_OPEN
+            if self.opened_at is not None and (self.clock() - self.opened_at) >= self.reset_timeout:
+                self.state = CircuitState.HALF_OPEN
+                self.opened_at = None
+                return False
+            return True
+        # CLOSED or HALF_OPEN are not open (HALF_OPEN allows probing)
+        return False
 
 
 class Router:
-    """Router that selects providers deterministically and handles retries, fallback and circuit breakers."""
+    """Router that selects providers deterministically and handles retries, fallback and circuit breakers.
+
+    Ordering rules (shared by select() and call()):
+    - deterministic by provider.id
+    - exclude providers whose circuit is OPEN
+    - prefer providers NOT below preventive_threshold first
+    - providers below threshold only considered as last resort
+    """
 
     def __init__(self,
                  providers: List[Provider],
@@ -63,18 +102,45 @@ class Router:
                  cb_factory: Callable[[], CircuitBreaker] = lambda: CircuitBreaker()):
         if not providers:
             raise ValueError("providers list must not be empty")
+        # validate unique ids deterministically
+        ids = [p.id for p in providers]
+        dupes = sorted({x for x in ids if ids.count(x) > 1})
+        if dupes:
+            # deterministic single-message error
+            raise ValueError(f"duplicate provider id: '{dupes[0]}'")
+
+        try:
+            threshold = float(preventive_threshold)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("preventive_threshold must be a finite value between 0 and 1") from exc
+        if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+            raise ValueError("preventive_threshold must be a finite value between 0 and 1")
+
         self.providers = providers
-        self.threshold = preventive_threshold
+        self.threshold = threshold
         self.backoff = backoff
         self.max_retries = max_retries
-        # per-provider circuit breakers
+        # per-provider circuit breakers (invoke factory for each provider)
         self.cbs: Dict[str, CircuitBreaker] = {p.id: cb_factory() for p in providers}
 
-    def _eligible_providers(self) -> List[Provider]:
+    def _candidate_order(self) -> List[Provider]:
         # deterministic order by id
         ordered = sorted(self.providers, key=lambda p: p.id)
-        # filter out open circuit breakers
-        return [p for p in ordered if not self.cbs[p.id].is_open()]
+        # exclude providers with OPEN circuit
+        non_open = [p for p in ordered if not self.cbs[p.id].is_open()]
+        # split by threshold: first those NOT below threshold, then those below
+        not_below = []
+        below = []
+        for p in non_open:
+            try:
+                q = p.get_quota()
+            except Exception:
+                q = QuotaState()
+            if not self._below_threshold(q):
+                not_below.append(p)
+            else:
+                below.append(p)
+        return not_below + below
 
     def _below_threshold(self, q: QuotaState) -> bool:
         if q.limit and q.remaining is not None:
@@ -86,35 +152,33 @@ class Router:
         return False
 
     def select(self) -> Provider:
-        """Select first provider that is not below threshold; if all below, choose first eligible; unknown quotas are treated as acceptable and selected deterministically."""
-        eligible = self._eligible_providers()
-        if not eligible:
-            # all circuited; fall back to all providers (even if open) to allow attempts
-            eligible = sorted(self.providers, key=lambda p: p.id)
-        # prefer providers with known good quota
-        for p in eligible:
-            q = p.get_quota()
-            if not self._below_threshold(q):
-                return p
-        # fallback deterministic
-        return eligible[0]
+        """Select first provider according to candidate ordering. If no candidates (all OPEN), raise RuntimeError with deterministic message."""
+        candidates = self._candidate_order()
+        if not candidates:
+            raise RuntimeError("All providers are in OPEN state")
+        return candidates[0]
 
     def call(self, *args, **kwargs) -> Any:
-        """Attempt call using selection + retries + fallback.
-        On failure, mark circuit breaker failure and try next provider.
+        """Attempt call using the shared candidate ordering, retries, and per-provider circuit rules.
+
+        - HALF_OPEN: allow a single probe (no retries); success closes circuit, failure re-opens and move to next provider
+        - CLOSED: allow up to max_retries+1 attempts, but if record_failure opened the circuit, stop retrying this provider
+        - OPEN providers are excluded from candidates
         """
-        tried = set()
         last_exc = None
-        providers_list = self._eligible_providers() or sorted(self.providers, key=lambda p: p.id)
-        for p in providers_list:
-            if p.id in tried:
-                continue
+        candidates = self._candidate_order()
+        if not candidates:
+            raise RuntimeError("All providers are in OPEN state")
+
+        for p in candidates:
             cb = self.cbs[p.id]
-            if cb.is_open():
-                tried.add(p.id)
-                continue
-            # try with retries
-            for attempt in range(0, self.max_retries + 1):
+            # Determine allowed attempts: 1 for HALF_OPEN, else max_retries+1 for CLOSED
+            if cb.state == CircuitState.HALF_OPEN:
+                attempts_allowed = 1
+            else:
+                attempts_allowed = self.max_retries + 1
+
+            for attempt in range(attempts_allowed):
                 try:
                     result = p.call(*args, **kwargs)
                     cb.record_success()
@@ -122,15 +186,16 @@ class Router:
                 except Exception as exc:
                     last_exc = exc
                     cb.record_failure()
-                    if attempt < self.max_retries:
-                        delay = self.backoff(attempt)
-                        time.sleep(delay)
-                    else:
-                        # give up on this provider, try next
+                    # if circuit became OPEN, stop retrying this provider and proceed
+                    if cb.is_open() or cb.state == CircuitState.OPEN:
                         break
-            tried.add(p.id)
-        # all providers exhausted
+                    # otherwise, if we will retry this provider, sleep only then
+                    if attempt < (attempts_allowed - 1):
+                        delay = self.backoff(attempt)
+                        if delay:
+                            time.sleep(delay)
+                    # else will proceed to next provider
+            # move to next candidate
         if last_exc:
-            # raise a RuntimeError wrapping the last exception to ensure deterministic test behavior
-            raise RuntimeError(str(last_exc))
+            raise RuntimeError(str(last_exc)) from last_exc
         raise RuntimeError("No providers available")

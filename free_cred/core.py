@@ -131,5 +131,6 @@ class Router:
             tried.add(p.id)
         # all providers exhausted
         if last_exc:
-            raise last_exc
+            # raise a RuntimeError wrapping the last exception to ensure deterministic test behavior
+            raise RuntimeError(str(last_exc))
         raise RuntimeError("No providers available")

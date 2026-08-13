@@ -16,7 +16,8 @@ class FakeProvider:
 
     def call(self, *args, **kwargs):
         self.calls += 1
-        if self.fail and self.calls <= self.fail_times:
+        # if fail=True and fail_times==0 -> fail always; otherwise fail for first fail_times calls
+        if self.fail and (self.fail_times == 0 or self.calls <= self.fail_times):
             raise RuntimeError(f"provider {self.id} simulated failure")
         return f"ok:{self.id}"
 

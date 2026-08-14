@@ -12,6 +12,7 @@ requires-python = ">=3.12"
 # Non-secret configuration for local demo (FastAPI, testing)
 dependencies = [
     "fastapi>=0.95",
+    "openai>=1.0",
     "uvicorn>=0.22",
     "httpx>=0.24",
     "pytest>=7.0"
@@ -19,3 +20,9 @@ dependencies = [
 
 [tool.pytest]
 addopts = ["-q"]
+markers = [
+    "integration: tests that call real external providers when credentials are available"
+]
+
+[tool.setuptools.packages.find]
+include = ["free_cred*"]

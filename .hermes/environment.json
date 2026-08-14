@@ -1,0 +1,19 @@
+{
+  "name": "free-cred FastAPI app",
+  "kind": "fastapi",
+  "bootstrap": [
+    "py -3.12 -m pip install -e ."
+  ],
+  "build": [],
+  "test": [
+    "py -3.12 -m pytest"
+  ],
+  "start": "py -3.12 -m uvicorn free_cred.api:create_app --factory --host 127.0.0.1 --port 8000",
+  "port": 8000,
+  "readinessPath": "/health",
+  "evidence": [
+    "Project exposes FastAPI app through free_cred.api:create_app",
+    "Health endpoint is GET /health",
+    "Canonical test command is pytest"
+  ]
+}

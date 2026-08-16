@@ -20,6 +20,14 @@ class MockProvider:
             raise RuntimeError(f"provider {self.id} simulated failure")
         return {"provider": self.id, "payload": args or kwargs}
 
+    def health_check(self) -> Dict[str, Any]:
+        return {
+            "provider": self.id,
+            "status": "unhealthy" if self.fail else "healthy",
+            "ok": not self.fail,
+            "endpoint": "mock",
+        }
+
 
 @dataclass(frozen=True)
 class OpenAICompatiblePreset:
@@ -60,12 +68,12 @@ OPENAI_COMPATIBLE_PRESETS: Dict[str, OpenAICompatiblePreset] = {
         default_model="llama-3.1-8b-instant",
     ),
     "cerebras": OpenAICompatiblePreset(
-        id="cerebras",
-        base_url="https://api.cerebras.ai/v1",
-        api_key_env="CEREBRAS_API_KEY",
-        model_env="CEREBRAS_MODEL",
-        default_model="llama3.1-8b",
-    ),
+            id="cerebras",
+            base_url="https://api.cerebras.ai/v1",
+            api_key_env="CEREBRAS_API_KEY",
+            model_env="CEREBRAS_MODEL",
+            default_model="qwen-2.5-72b-instruct",
+        ),
     "together": OpenAICompatiblePreset(
         id="together",
         base_url="https://api.together.ai/v1",
@@ -86,6 +94,34 @@ OPENAI_COMPATIBLE_PRESETS: Dict[str, OpenAICompatiblePreset] = {
         api_key_env="GEMINI_API_KEY",
         model_env="GEMINI_MODEL",
         default_model="gemini-2.5-flash",
+    ),
+    "deepseek": OpenAICompatiblePreset(
+        id="deepseek",
+        base_url="https://api.deepseek.com/v1",
+        api_key_env="DEEPSEEK_API_KEY",
+        model_env="DEEPSEEK_MODEL",
+        default_model="deepseek-chat",
+    ),
+    "vercel": OpenAICompatiblePreset(
+        id="vercel",
+        base_url="https://ai-gateway.vercel.sh/v1",
+        api_key_env="VERCEL_API_KEY",
+        model_env="VERCEL_MODEL",
+        default_model="xai/grok-4.6",
+    ),
+    "openvino": OpenAICompatiblePreset(
+        id="openvino",
+        base_url="http://127.0.0.1:8767/v1",
+        api_key_env="OPENVINO_API_KEY",
+        model_env="OPENVINO_MODEL",
+        default_model="local-openvino",
+    ),
+    "copilot": OpenAICompatiblePreset(
+        id="copilot",
+        base_url="http://127.0.0.1:44716/v1",
+        api_key_env="COPILOT_API_KEY",
+        model_env="COPILOT_MODEL",
+        default_model="copilot",
     ),
 }
 
@@ -154,28 +190,122 @@ class OpenAICompatibleProvider:
 
     def call(self, payload=None, **kwargs):
         prompt = ""
-        if isinstance(payload, dict):
+        messages = None
+        if isinstance(payload, dict) and isinstance(payload.get("messages"), list):
+            messages = payload["messages"]
+        elif isinstance(payload, dict):
             prompt = str(payload.get("prompt") or "")
         elif payload is not None:
             prompt = str(payload)
-        if not prompt:
+        if messages is None and not prompt:
             prompt = "Respond with exactly: ok"
+        if messages is None:
+            messages = [{"role": "user", "content": prompt}]
 
-        completion = self._get_client().chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=kwargs.get("temperature", 0.2),
-            top_p=kwargs.get("top_p", 0.95),
-            max_tokens=kwargs.get("max_tokens", self.max_tokens),
-            extra_body=kwargs.get("extra_body"),
-            stream=False,
-        )
+        request = {
+            "model": self.model,
+            "messages": messages,
+        }
+        request["temperature"] = kwargs.get("temperature", 0.2)
+        request["top_p"] = kwargs.get("top_p", 0.95)
+        request["max_tokens"] = kwargs.get("max_tokens", self.max_tokens)
+        request["stream"] = False
+        if kwargs.get("extra_body") is not None:
+            request["extra_body"] = kwargs.get("extra_body")
+        if kwargs.get("tools") is not None:
+            request["tools"] = kwargs.get("tools")
+        if kwargs.get("tool_choice") is not None:
+            request["tool_choice"] = kwargs.get("tool_choice")
+        if kwargs.get("parallel_tool_calls") is not None:
+            request["parallel_tool_calls"] = kwargs.get("parallel_tool_calls")
+
+        completion = self._get_client().chat.completions.create(**request)
         message = completion.choices[0].message
-        return {
+        result = {
             "provider": self.id,
             "model": self.model,
             "content": message.content,
         }
+        tool_calls = getattr(message, "tool_calls", None)
+        if tool_calls:
+            result["tool_calls"] = [_serializable_tool_call(tool_call) for tool_call in tool_calls]
+        return result
+
+    def health_check(self, timeout: float = 2.0) -> Dict[str, Any]:
+        """Check provider metadata availability without generating tokens."""
+        endpoint = f"{self.base_url.rstrip('/')}/models"
+        headers = {}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        try:
+            import httpx
+        except ImportError as exc:
+            return _provider_health_result(
+                self,
+                endpoint,
+                ok=False,
+                message="httpx package is required for provider health checks",
+                error_type=exc.__class__.__name__,
+            )
+
+        try:
+            response = httpx.get(endpoint, headers=headers, timeout=timeout)
+        except Exception as exc:
+            return _provider_health_result(
+                self,
+                endpoint,
+                ok=False,
+                message="provider metadata probe failed",
+                error_type=exc.__class__.__name__,
+            )
+
+        ok = 200 <= response.status_code < 300
+        return _provider_health_result(
+            self,
+            endpoint,
+            ok=ok,
+            http_status=response.status_code,
+            message="ok" if ok else "provider metadata probe returned non-2xx status",
+        )
+
+
+def _serializable_tool_call(tool_call: Any) -> Any:
+    if hasattr(tool_call, "model_dump"):
+        return tool_call.model_dump()
+    if isinstance(tool_call, dict):
+        return tool_call
+    return {
+        "id": getattr(tool_call, "id", None),
+        "type": getattr(tool_call, "type", None),
+        "function": getattr(tool_call, "function", None),
+    }
+
+
+def _provider_health_result(
+    provider: OpenAICompatibleProvider,
+    endpoint: str,
+    *,
+    ok: bool,
+    message: str,
+    http_status: Optional[int] = None,
+    error_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "provider": provider.id,
+        "status": "healthy" if ok else "unhealthy",
+        "ok": ok,
+        "endpoint": endpoint,
+        "model": provider.model,
+        "api_key_env": provider.api_key_env,
+        "configured": bool(provider._api_key),
+        "message": message,
+        "probe_type": "metadata_models_endpoint",
+    }
+    if http_status is not None:
+        result["http_status"] = http_status
+    if error_type is not None:
+        result["error_type"] = error_type
+    return result
 
 
 class NvidiaNemotronProvider(OpenAICompatibleProvider):
@@ -293,7 +423,7 @@ def openai_compatible_providers_from_preset(
     ]
 
 
-def providers_from_env() -> List[Provider]:
+def providers_from_env(quota_source: Optional[Callable[[str], QuotaState]] = None) -> List[Provider]:
     """Create mock providers from PROVIDERS env var (comma-separated ids).
     Example: PROVIDERS=a,b or PROVIDERS=nvidia,groq,openrouter
     """
@@ -302,7 +432,7 @@ def providers_from_env() -> List[Provider]:
     out: List[Provider] = []
     for i, pid in enumerate(ids):
         if pid.lower() in OPENAI_COMPATIBLE_PRESETS:
-            out.extend(openai_compatible_providers_from_preset(pid))
+            out.extend(openai_compatible_providers_from_preset(pid, quota_source=quota_source))
             continue
         # stagger quotas for demo
         remaining = None if i % 2 == 0 else 80

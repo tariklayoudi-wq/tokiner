@@ -99,7 +99,8 @@ class Router:
                  preventive_threshold: float = 0.1,
                  backoff: Callable[[int], float] = lambda n: 0.1 * (2 ** n),
                  max_retries: int = 2,
-                 cb_factory: Callable[[], CircuitBreaker] = lambda: CircuitBreaker()):
+                 cb_factory: Callable[[], CircuitBreaker] = lambda: CircuitBreaker(),
+                 priority_order: Optional[List[str]] = None):
         if not providers:
             raise ValueError("providers list must not be empty")
         # validate unique ids deterministically
@@ -120,12 +121,13 @@ class Router:
         self.threshold = threshold
         self.backoff = backoff
         self.max_retries = max_retries
+        self.priority_order = priority_order or ["nvidia", "openvino", "copilot"]
         # per-provider circuit breakers (invoke factory for each provider)
         self.cbs: Dict[str, CircuitBreaker] = {p.id: cb_factory() for p in providers}
 
     def _candidate_order(self) -> List[Provider]:
-        # deterministic order by id
-        ordered = sorted(self.providers, key=lambda p: p.id)
+        # deterministic explicit provider priority, then by id
+        ordered = sorted(self.providers, key=lambda p: (self._priority_rank(p), p.id))
         # exclude providers with OPEN circuit
         non_open = [p for p in ordered if not self.cbs[p.id].is_open()]
         # split by threshold: first those NOT below threshold, then those below
@@ -141,6 +143,13 @@ class Router:
             else:
                 below.append(p)
         return not_below + below
+
+    def _priority_rank(self, provider: Provider) -> int:
+        provider_id = provider.id.lower()
+        for rank, prefix in enumerate(self.priority_order):
+            if provider_id == prefix or provider_id.startswith(f"{prefix}-") or provider_id.startswith(f"{prefix}:"):
+                return rank
+        return len(self.priority_order)
 
     def _below_threshold(self, q: QuotaState) -> bool:
         if q.limit and q.remaining is not None:
@@ -163,6 +172,7 @@ class Router:
 
         - HALF_OPEN: allow a single probe (no retries); success closes circuit, failure re-opens and move to next provider
         - CLOSED: allow up to max_retries+1 attempts, but if record_failure opened the circuit, stop retrying this provider
+        - HTTP 401/403/404/429/500 and timeout-like exceptions fallback immediately without retrying the same provider
         - OPEN providers are excluded from candidates
         """
         last_exc = None
@@ -186,6 +196,8 @@ class Router:
                 except Exception as exc:
                     last_exc = exc
                     cb.record_failure()
+                    if _should_fallback_without_retry(exc):
+                        break
                     # if circuit became OPEN, stop retrying this provider and proceed
                     if cb.is_open() or cb.state == CircuitState.OPEN:
                         break
@@ -199,3 +211,22 @@ class Router:
         if last_exc:
             raise RuntimeError(str(last_exc)) from last_exc
         raise RuntimeError("No providers available")
+
+
+def _should_fallback_without_retry(exc: Exception) -> bool:
+    status_code = _status_code_from_exception(exc)
+    if status_code in {401, 403, 404, 429, 500}:
+        return True
+    name = exc.__class__.__name__.lower()
+    return "timeout" in name or "timedout" in name
+
+
+def _status_code_from_exception(exc: Exception) -> Optional[int]:
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+    return None

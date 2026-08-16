@@ -22,6 +22,22 @@ class FakeProvider:
         return f"ok:{self.id}"
 
 
+class StatusCodeError(RuntimeError):
+    def __init__(self, status_code):
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+
+
+class StatusFailProvider(FakeProvider):
+    def __init__(self, id, status_code):
+        super().__init__(id)
+        self.status_code = status_code
+
+    def call(self, *args, **kwargs):
+        self.calls += 1
+        raise StatusCodeError(self.status_code)
+
+
 def test_prefers_higher_quota_and_skips_low():
     a = FakeProvider("a", remaining=1, limit=100)
     b = FakeProvider("b", remaining=80, limit=100)
@@ -29,6 +45,42 @@ def test_prefers_higher_quota_and_skips_low():
     res = r.call()
     assert res == "ok:b"
     assert a.calls == 0
+
+
+def test_explicit_provider_priority_prefers_nvidia_openvino_copilot():
+    copilot = FakeProvider("copilot")
+    openvino = FakeProvider("openvino")
+    nvidia = FakeProvider("nvidia-nemotron")
+    r = Router([copilot, openvino, nvidia], backoff=lambda n: 0, max_retries=0)
+
+    assert r.select().id == "nvidia-nemotron"
+    assert r.call() == "ok:nvidia-nemotron"
+    assert nvidia.calls == 1
+    assert openvino.calls == 0
+    assert copilot.calls == 0
+
+
+def test_explicit_priority_falls_back_to_openvino_then_copilot():
+    nvidia = FakeProvider("nvidia-nemotron", fail=True)
+    openvino = FakeProvider("openvino")
+    copilot = FakeProvider("copilot")
+    r = Router([copilot, openvino, nvidia], backoff=lambda n: 0, max_retries=0)
+
+    assert r.call() == "ok:openvino"
+    assert nvidia.calls == 1
+    assert openvino.calls == 1
+    assert copilot.calls == 0
+
+
+@pytest.mark.parametrize("status_code", [401, 403, 404, 429, 500])
+def test_status_errors_fallback_without_retry(status_code):
+    nvidia = StatusFailProvider("nvidia-nemotron", status_code)
+    openvino = FakeProvider("openvino")
+    r = Router([nvidia, openvino], backoff=lambda n: 0, max_retries=3)
+
+    assert r.call() == "ok:openvino"
+    assert nvidia.calls == 1
+    assert openvino.calls == 1
 
 
 def test_fallback_when_all_below_threshold():

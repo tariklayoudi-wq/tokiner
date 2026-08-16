@@ -80,6 +80,31 @@ def test_openai_compatible_provider_calls_chat_completions():
     assert sent["stream"] is False
 
 
+def test_openai_compatible_provider_passes_agentic_messages_and_tools():
+    client = FakeClient()
+    provider = OpenAICompatibleProvider(
+        id="example",
+        model="example/free",
+        api_key_env="EXAMPLE_API_KEY",
+        client=client,
+    )
+    messages = [{"role": "user", "content": "Use a tool if needed"}]
+    tools = [{"type": "function", "function": {"name": "ping", "parameters": {"type": "object"}}}]
+
+    provider.call(
+        {"messages": messages},
+        tools=tools,
+        tool_choice="auto",
+        parallel_tool_calls=False,
+    )
+
+    sent = client.chat.completions.calls[0]
+    assert sent["messages"] == messages
+    assert sent["tools"] == tools
+    assert sent["tool_choice"] == "auto"
+    assert sent["parallel_tool_calls"] is False
+
+
 def test_openai_compatible_provider_requires_provider_specific_key(monkeypatch):
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     provider = openai_compatible_provider_from_preset("groq")

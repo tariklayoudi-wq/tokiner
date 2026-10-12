@@ -1,0 +1,64 @@
+name: Independently audit signed iPhone Commander V2
+on:
+  push:
+    branches: [ci/iphone-shortcuts-pack-20261012]
+    paths: [.github/workflows/iphone-shortcuts-v2-audit.yml]
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare independent Linux shortcut-sign extractor
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --connect-timeout 15 --max-time 60 -fsS \
+            https://github.com/0xilis/shortcut-sign/releases/download/v1.0.0-beta.5/shortcut-sign-linux-x86_64 \
+            -o /tmp/shortcut-sign
+          chmod +x /tmp/shortcut-sign
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libplist-dev libssl-dev >/dev/null
+          /tmp/shortcut-sign version
+      - name: Extract and compare signed actions against locally generated source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64,lzma
+          src=lzma.decompress(base64.b64decode(Path('iphone-ai-commander-v2/source-builder.xz.b64').read_text().strip()))
+          Path('/tmp/build_iphone_commander.py').write_bytes(src)
+          PY
+          python3 /tmp/build_iphone_commander.py
+          mkdir -p /tmp/recovered
+          for f in iphone-ai-commander-v2/signed/*.shortcut; do
+            name=$(basename "$f")
+            /tmp/shortcut-sign extract -i "$f" -o "/tmp/recovered/$name"
+            test -s "/tmp/recovered/$name"
+          done
+          python3 - <<'PY'
+          import plistlib
+          from pathlib import Path
+          def canonical_actions(obj):
+              ids={a['WFWorkflowActionParameters']['UUID']:f'a{i}' for i,a in enumerate(obj['WFWorkflowActions'])}
+              groups={}
+              for a in obj['WFWorkflowActions']:
+                  g=a['WFWorkflowActionParameters'].get('GroupingIdentifier')
+                  if g and g not in groups: groups[g]=f'g{len(groups)}'
+              def norm(v):
+                  if isinstance(v,list):return [norm(t) for t in v]
+                  if isinstance(v,dict):
+                      return {k:(ids.get(val,groups.get(val,val)) if k in ('UUID','OutputUUID','GroupingIdentifier') and isinstance(val,str)
+                                 else norm(val)) for k,val in v.items()}
+                  return v
+              return norm(obj['WFWorkflowActions'])
+          for signed in sorted(Path('iphone-ai-commander-v2/signed').glob('*.shortcut')):
+              extracted=plistlib.loads((Path('/tmp/recovered')/signed.name).read_bytes())
+              built=plistlib.loads((Path('/tmp')/(signed.stem+'.unsigned.shortcut')).read_bytes())
+              assert canonical_actions(extracted)==canonical_actions(built), (
+                 'SIGNED_CONTENT_MISMATCH',signed.name)
+              print('VERIFIED_SIGNED_ACTIONS_MATCH_SOURCE',signed.name,len(built['WFWorkflowActions']))
+          PY

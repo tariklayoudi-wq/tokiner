@@ -1,0 +1,103 @@
+name: Build and sign iPhone AI Commander V2
+on:
+  push:
+    branches: [ci/iphone-shortcuts-pack-20261012]
+    paths:
+      - .github/workflows/iphone-shortcuts-v2.yml
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and audit native shortcuts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64,lzma
+          p=Path('iphone-ai-commander-v2/source-builder.xz.b64')
+          code=lzma.decompress(base64.b64decode(p.read_text().strip()))
+          Path('/tmp/build_iphone_commander.py').write_bytes(code)
+          print('BUILDER_SHA256', __import__('hashlib').sha256(code).hexdigest())
+          PY
+          python3 /tmp/build_iphone_commander.py
+          python3 - <<'PY'
+          import plistlib
+          from pathlib import Path
+          allowed={'is.workflow.actions.comment','is.workflow.actions.ask','ai.pocketpal.AskPalIntent',
+                   'is.workflow.actions.detect.text','is.workflow.actions.text.changecase',
+                   'is.workflow.actions.conditional','is.workflow.actions.showresult',
+                   'is.workflow.actions.alert','is.workflow.actions.setclipboard',
+                   'is.workflow.actions.openurl','is.workflow.actions.exit'}
+          for path in sorted(Path('/tmp').glob('*.unsigned.shortcut')):
+              p=plistlib.loads(path.read_bytes())
+              acts=p['WFWorkflowActions']
+              unknown=[a['WFWorkflowActionIdentifier'] for a in acts if a['WFWorkflowActionIdentifier'] not in allowed]
+              assert not unknown, unknown
+              intents=[a for a in acts if a['WFWorkflowActionIdentifier']=='ai.pocketpal.AskPalIntent']
+              assert len(intents) >= 1
+              for a in intents:
+                  d=a['WFWorkflowActionParameters']['AppIntentDescriptor']
+                  assert d['BundleIdentifier']=='ai.pocketpal'
+                  assert d['AppIntentIdentifier']=='AskPalIntent'
+                  assert 'pal' not in a['WFWorkflowActionParameters']  # user must bind after import
+              for a in acts:
+                  if a['WFWorkflowActionIdentifier']=='is.workflow.actions.openurl':
+                      assert a['WFWorkflowActionParameters']['WFInput'] in {
+                       'https://chatgpt.com/','https://claude.ai/','https://gemini.google.com/app','https://www.perplexity.ai/'}
+              print('AUDIT_PASS',path.name,len(acts),'actions')
+          PY
+      - name: Sign with RoutineHub HubSign and check AEA1
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import plistlib,json,time,urllib.request,urllib.error,hashlib
+          from pathlib import Path
+          base=Path('iphone-ai-commander-v2/signed')
+          base.mkdir(parents=True,exist_ok=True)
+          hdr={'Content-Type':'application/json','User-Agent':'cherri/1.0',
+               'Origin':'https://routinehub.co','Referer':'https://routinehub.co/'}
+          for unsigned in sorted(Path('/tmp').glob('*.unsigned.shortcut')):
+              data=unsigned.read_bytes()
+              obj=plistlib.loads(data)
+              post=json.dumps({'shortcutName':obj['WFWorkflowName'],
+                'shortcut':plistlib.dumps(obj,fmt=plistlib.FMT_XML).decode('utf-8')},
+                ensure_ascii=False).encode('utf-8')
+              req=urllib.request.Request('https://hubsign.routinehub.services/sign',
+                 data=post,headers=hdr,method='POST')
+              response=None
+              for attempt in range(2):
+                  try:
+                      with urllib.request.urlopen(req,timeout=75) as f:
+                          response=f.read()
+                      break
+                  except (urllib.error.HTTPError, urllib.error.URLError):
+                      if attempt: raise
+                      time.sleep(3)
+              assert response and response[:4]==b'AEA1' and len(response)>1000, (
+                'invalid signed response', repr(response[:120] if response else b''))
+              name=unsigned.name.replace('.unsigned.shortcut','.shortcut')
+              dest=base/name
+              dest.write_bytes(response)
+              print('SIGNED',name,'bytes',len(response),
+                    'sha256',hashlib.sha256(response).hexdigest())
+          assert len(list(base.glob('*.shortcut')))==2
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iPhone-AI-Commander-V2-signed
+          path: iphone-ai-commander-v2/signed/*.shortcut
+          retention-days: 7
+      - name: Commit signed shortcuts for direct public download
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add iphone-ai-commander-v2/signed
+          git commit -m 'Publish RoutineHub-signed iOS AI Commander V2 shortcuts (no secrets)' || exit 0
+          git push origin HEAD:ci/iphone-shortcuts-pack-20261012

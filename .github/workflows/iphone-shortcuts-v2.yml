@@ -30,6 +30,7 @@ jobs:
           from pathlib import Path
           allowed={'is.workflow.actions.comment','is.workflow.actions.ask','ai.pocketpal.AskPalIntent',
                    'is.workflow.actions.detect.text','is.workflow.actions.text.changecase',
+                   'is.workflow.actions.text.trimwhitespace',
                    'is.workflow.actions.conditional','is.workflow.actions.showresult',
                    'is.workflow.actions.alert','is.workflow.actions.setclipboard',
                    'is.workflow.actions.openurl','is.workflow.actions.exit'}

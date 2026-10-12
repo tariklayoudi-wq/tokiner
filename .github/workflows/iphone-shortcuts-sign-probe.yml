@@ -1,0 +1,42 @@
+name: Probe external Apple Shortcut signing
+on:
+  push:
+    branches: [ci/iphone-shortcuts-pack-20261012]
+    paths: [.github/workflows/iphone-shortcuts-sign-probe.yml]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Generate harmless local demonstration shortcut
+        run: |
+          python3 - <<'PY'
+          import plistlib,uuid
+          d={'WFWorkflowName':'AI Commander Signature Probe','WFWorkflowClientVersion':'2607.1','WFWorkflowMinimumClientVersion':900,
+          'WFWorkflowIcon':{'WFWorkflowIconGlyphNumber':61440,'WFWorkflowIconStartColor':1440408063},
+          'WFWorkflowActions':[{'WFWorkflowActionIdentifier':'is.workflow.actions.showresult',
+          'WFWorkflowActionParameters':{'UUID':str(uuid.uuid4()).upper(),'Text':'AI Commander signature probe. No external action.'}}],
+          'WFWorkflowInputContentItemClasses':['WFStringContentItem'],'WFWorkflowTypes':[]}
+          with open('sign-probe.unsigned.shortcut','wb') as f:plistlib.dump(d,f,fmt=plistlib.FMT_BINARY)
+          print('unsigned',len(open('sign-probe.unsigned.shortcut','rb').read()))
+          PY
+      - name: Sign using independent signing service (no user data)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --connect-timeout 10 --max-time 90 --retry 1 --fail-with-body -sS \
+            -F 'file=@sign-probe.unsigned.shortcut' \
+            'https://sign.shortcuty.app/api/v1/sign' -o sign-probe.signed.shortcut
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('sign-probe.signed.shortcut')
+          b=p.read_bytes()
+          print('SIGNED_SIZE',len(b),'MAGIC',repr(b[:4]))
+          assert b.startswith(b'AEA1') and len(b)>1000
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apple-signed-shortcuts-probe
+          path: sign-probe.signed.shortcut
